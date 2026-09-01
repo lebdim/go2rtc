@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/url"
 	"sync"
@@ -93,12 +92,11 @@ type Client struct {
 	key   []byte
 	model string
 
-	queryMu sync.Mutex
+	motorMu sync.Mutex
 	stateMu sync.RWMutex
 
 	position *PTZPosition
 	waiter   chan motorResult
-	readErr  error
 
 	done      chan struct{}
 	closeOnce sync.Once
@@ -124,7 +122,12 @@ const (
 	cmdDevInfoRes        = 0x111
 	cmdMotorReq          = 0x112
 	cmdMotorRes          = 0x113
-	cmdEncoded           = 0x1001
+	// Cruise command IDs exist in Xiaomi SDKs, but payload semantics for
+	// xiaomi.camera.c01a01 were not established from the Xiaomi Home plugin or
+	// verified against the device, so cruise support is intentionally omitted.
+	cmdCruiseStateReq = 0x200
+	cmdCruiseStateRes = 0x201
+	cmdEncoded        = 0x1001
 )
 
 func login(conn Conn, clientPublic, sign string) error {
@@ -340,22 +343,22 @@ func (c *Client) Move(direction string) error {
 		return fmt.Errorf("xiaomi ptz: invalid direction %q", direction)
 	}
 
-	return c.sendMotorCommand(operation, nil, nil)
+	return c.runMotorCommand(operation, nil, nil)
 }
 
 func (c *Client) StopMove() error {
-	return c.sendMotorCommand(motorStop, nil, nil)
+	return c.runMotorCommand(motorStop, nil, nil)
 }
 
 func (c *Client) Calibrate() error {
-	return c.sendMotorCommand(motorCheck, nil, nil)
+	return c.runMotorCommand(motorCheck, nil, nil)
 }
 
 func (c *Client) SetPosition(angle, elevation int) error {
 	if err := validateTargetPosition(angle, elevation); err != nil {
 		return err
 	}
-	return c.sendMotorCommand(motorAbsolute, &angle, &elevation)
+	return c.runMotorCommand(motorAbsolute, &angle, &elevation)
 }
 
 func (c *Client) RefreshPosition(ctx context.Context) (*PTZPosition, error) {
@@ -363,8 +366,13 @@ func (c *Client) RefreshPosition(ctx context.Context) (*PTZPosition, error) {
 		return nil, err
 	}
 
-	c.queryMu.Lock()
-	defer c.queryMu.Unlock()
+	// The protocol does not expose a request ID for MOTOR_RESP. RefreshPosition
+	// therefore returns the next MOTOR_RESP received after sending operation=6
+	// while all locally issued motor commands are serialized behind motorMu.
+	// Unsolicited device MOTOR_RESP frames still update the cache and may satisfy
+	// the waiter because that ambiguity cannot be removed protocol-side.
+	c.motorMu.Lock()
+	defer c.motorMu.Unlock()
 
 	waiter := make(chan motorResult, 1)
 	c.setWaiter(waiter)
@@ -423,6 +431,12 @@ func motorCommandPayload(operation int, angle, elevation *int) ([]byte, error) {
 	})
 }
 
+func (c *Client) runMotorCommand(operation int, angle, elevation *int) error {
+	c.motorMu.Lock()
+	defer c.motorMu.Unlock()
+	return c.sendMotorCommand(operation, angle, elevation)
+}
+
 func (c *Client) sendMotorCommand(operation int, angle, elevation *int) error {
 	payload, err := motorCommandPayload(operation, angle, elevation)
 	if err != nil {
@@ -440,9 +454,6 @@ func (c *Client) commandLoop() {
 	for {
 		cmd, data, err := c.Conn.ReadCommand()
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				c.setCommandError(err)
-			}
 			c.resolveWaiter(motorResult{err: err})
 			return
 		}
@@ -507,20 +518,6 @@ func (c *Client) resolveWaiter(result motorResult) {
 	if waiter != nil {
 		waiter <- result
 	}
-}
-
-func (c *Client) setCommandError(err error) {
-	c.stateMu.Lock()
-	if c.readErr == nil {
-		c.readErr = err
-	}
-	c.stateMu.Unlock()
-}
-
-func (c *Client) commandError() error {
-	c.stateMu.RLock()
-	defer c.stateMu.RUnlock()
-	return c.readErr
 }
 
 const hdrSize = 32

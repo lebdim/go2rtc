@@ -113,7 +113,7 @@ func TestMotorPayloads(t *testing.T) {
 		{name: "up", run: func() error { return client.Move("up") }, command: cmdMotorReq, jsonValue: `{"operation":3}`},
 		{name: "down", run: func() error { return client.Move("down") }, command: cmdMotorReq, jsonValue: `{"operation":4}`},
 		{name: "calibrate", run: func() error { return client.Calibrate() }, command: cmdMotorReq, jsonValue: `{"operation":5}`},
-		{name: "get", run: func() error { return client.sendMotorCommand(motorGet, nil, nil) }, command: cmdMotorReq, jsonValue: `{"operation":6}`},
+		{name: "get", run: func() error { return client.runMotorCommand(motorGet, nil, nil) }, command: cmdMotorReq, jsonValue: `{"operation":6}`},
 		{name: "stop", run: func() error { return client.StopMove() }, command: cmdMotorReq, jsonValue: `{"operation":-1001}`},
 		{name: "absolute", run: func() error { return client.SetPosition(50, 50) }, command: cmdMotorReq, jsonValue: `{"operation":13,"angle":50,"elevation":50}`},
 	}
@@ -256,6 +256,90 @@ func TestRefreshPositionSerializesWaiters(t *testing.T) {
 	state := client.PTZState()
 	require.NotNil(t, state.Position)
 	require.Equal(t, 40, state.Position.Angle)
+}
+
+func TestRefreshPositionBlocksConcurrentMove(t *testing.T) {
+	key := make([]byte, 32)
+	conn := newFakeConn()
+	client := newTestClient(conn, key)
+	go client.commandLoop()
+	defer func() {
+		require.NoError(t, client.Close())
+	}()
+
+	refreshDone := make(chan error, 1)
+	go func() {
+		_, err := client.RefreshPosition(context.Background())
+		refreshDone <- err
+	}()
+
+	firstWrite := <-conn.writes
+	cmd, payload := decodeWrite(t, key, firstWrite)
+	require.Equal(t, uint32(cmdMotorReq), cmd)
+	require.Equal(t, `{"operation":6}`, payload)
+
+	moveDone := make(chan error, 1)
+	go func() {
+		moveDone <- client.Move("right")
+	}()
+
+	select {
+	case write := <-conn.writes:
+		_, payload = decodeWrite(t, key, write)
+		t.Fatalf("move should not write during refresh, got %s", payload)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	conn.reads <- encodeRead(t, key, cmdMotorRes, `{"angle":73,"elevation":41,"ret":0}`)
+	require.NoError(t, <-refreshDone)
+
+	moveWrite := <-conn.writes
+	cmd, payload = decodeWrite(t, key, moveWrite)
+	require.Equal(t, uint32(cmdMotorReq), cmd)
+	require.Equal(t, `{"operation":2}`, payload)
+	require.NoError(t, <-moveDone)
+}
+
+func TestRefreshPositionBlocksConcurrentSetPosition(t *testing.T) {
+	key := make([]byte, 32)
+	conn := newFakeConn()
+	client := newTestClient(conn, key)
+	go client.commandLoop()
+	defer func() {
+		require.NoError(t, client.Close())
+	}()
+
+	refreshDone := make(chan error, 1)
+	go func() {
+		_, err := client.RefreshPosition(context.Background())
+		refreshDone <- err
+	}()
+
+	firstWrite := <-conn.writes
+	cmd, payload := decodeWrite(t, key, firstWrite)
+	require.Equal(t, uint32(cmdMotorReq), cmd)
+	require.Equal(t, `{"operation":6}`, payload)
+
+	setDone := make(chan error, 1)
+	go func() {
+		setDone <- client.SetPosition(50, 60)
+	}()
+
+	select {
+	case write := <-conn.writes:
+		_, payload = decodeWrite(t, key, write)
+		t.Fatalf("set position should not write during refresh, got %s", payload)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	conn.reads <- encodeRead(t, key, cmdMotorRes, `{"angle":73,"elevation":41,"ret":0}`)
+	require.NoError(t, <-refreshDone)
+
+	setWrite := <-conn.writes
+	cmd, payload = decodeWrite(t, key, setWrite)
+	require.Equal(t, uint32(cmdMotorReq), cmd)
+	require.Equal(t, `{"operation":13,"angle":50,"elevation":60}`, payload)
+	require.NoError(t, <-setDone)
 }
 
 func TestRefreshPositionTimeoutAndUnsolicitedUpdate(t *testing.T) {

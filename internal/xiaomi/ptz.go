@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -248,7 +249,7 @@ func writePTZError(w http.ResponseWriter, err error) {
 		http.Error(w, "response timeout", http.StatusGatewayTimeout)
 	case errors.Is(err, context.Canceled):
 		http.Error(w, err.Error(), http.StatusRequestTimeout)
-	case errors.Is(err, net.ErrClosed):
+	case errors.Is(err, io.EOF), errors.Is(err, net.ErrClosed):
 		http.Error(w, "xiaomi producer disconnected", http.StatusServiceUnavailable)
 	case err.Error() == api.StreamNotFound:
 		http.Error(w, err.Error(), http.StatusNotFound)

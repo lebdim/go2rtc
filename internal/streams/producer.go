@@ -82,6 +82,12 @@ func (p *Producer) GetMedias() []*core.Media {
 	return p.conn.GetMedias()
 }
 
+func (p *Producer) ActiveConn() core.Producer {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.conn
+}
+
 func (p *Producer) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

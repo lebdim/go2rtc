@@ -3,6 +3,7 @@ package xiaomi
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -240,4 +241,22 @@ func TestAPIInactiveNonXiaomiStream(t *testing.T) {
 
 	require.Equal(t, http.StatusBadRequest, w.Code)
 	require.Contains(t, w.Body.String(), "stream is not Xiaomi")
+}
+
+func TestAPIRefreshEOFMapsToServiceUnavailable(t *testing.T) {
+	producer := &fakePTZProducer{
+		state: miss.PTZState{Connected: true},
+		refreshFn: func(context.Context) (*miss.PTZPosition, error) {
+			return nil, io.EOF
+		},
+	}
+	setupStream(t, "ptz-eof", "test://camera", producer)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/xiaomi/ptz?src=ptz-eof&refresh=true", nil)
+	w := httptest.NewRecorder()
+
+	apiPTZ(w, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+	require.Contains(t, w.Body.String(), "xiaomi producer disconnected")
 }

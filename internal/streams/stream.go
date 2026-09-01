@@ -57,19 +57,26 @@ func (s *Stream) Sources() []string {
 
 func (s *Stream) ActiveProducers() []core.Producer {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	producers := make([]*Producer, len(s.producers))
+	copy(producers, s.producers)
+	s.mu.Unlock()
 
-	producers := make([]core.Producer, 0, len(s.producers))
-	for _, producer := range s.producers {
-		if producer.conn != nil {
-			producers = append(producers, producer.conn)
+	active := make([]core.Producer, 0, len(producers))
+	for _, producer := range producers {
+		if conn := producer.ActiveConn(); conn != nil {
+			active = append(active, conn)
 		}
 	}
-	return producers
+	return active
 }
 
 func (s *Stream) SetSource(source string) {
-	for _, prod := range s.producers {
+	s.mu.Lock()
+	producers := make([]*Producer, len(s.producers))
+	copy(producers, s.producers)
+	s.mu.Unlock()
+
+	for _, prod := range producers {
 		prod.SetSource(source)
 	}
 }
