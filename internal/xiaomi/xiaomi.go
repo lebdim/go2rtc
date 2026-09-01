@@ -48,6 +48,7 @@ func Init() {
 	})
 
 	api.HandleFunc("api/xiaomi", apiXiaomi)
+	api.HandleFunc("api/xiaomi/ptz", apiPTZ)
 }
 
 var log zerolog.Logger

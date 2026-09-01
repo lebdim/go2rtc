@@ -2,12 +2,16 @@ package miss
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/tutk"
@@ -72,8 +76,15 @@ func NewClient(rawURL string) (*Client, error) {
 		return nil, err
 	}
 
-	client := &Client{Conn: conn, key: key, model: model}
-	client.startCommandLoop()
+	client := &Client{
+		Conn:  conn,
+		key:   key,
+		model: model,
+		done:  make(chan struct{}),
+	}
+	// commandLoop both decodes PTZ motor responses and continuously drains
+	// channel 0, which is what the buffer-overflow drain fix actually needed.
+	go client.commandLoop()
 	return client, nil
 }
 
@@ -81,20 +92,16 @@ type Client struct {
 	Conn
 	key   []byte
 	model string
-}
 
-// startCommandLoop drains the command channel (channel 0) in the background.
-// Without this, cameras that send periodic control messages (~1 per 10s) fill
-// the channel buffer (cap 10) in ~100s, causing "cs2: pop buffer is full" and
-// a connection crash.  Fixes https://github.com/AlexxIT/go2rtc/issues/2234.
-func (c *Client) startCommandLoop() {
-	go func() {
-		for {
-			if _, _, err := c.Conn.ReadCommand(); err != nil {
-				return
-			}
-		}
-	}()
+	queryMu sync.Mutex
+	stateMu sync.RWMutex
+
+	position *PTZPosition
+	waiter   chan motorResult
+	readErr  error
+
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 const (
@@ -150,6 +157,15 @@ func (c *Client) WriteCommand(data []byte) error {
 	return c.Conn.WriteCommand(cmdEncoded, data)
 }
 
+func (c *Client) Close() error {
+	var err error
+	c.closeOnce.Do(func() {
+		err = c.Conn.Close()
+	})
+	<-c.done
+	return err
+}
+
 const (
 	ModelDafang  = "isa.camera.df3"
 	ModelLoockV2 = "loock.cateye.v02"
@@ -159,6 +175,54 @@ const (
 	// There is also an older model "isa.camera.isc5" that only works with the legacy protocol.
 	ModelXiaofang = "isa.camera.isc5c1"
 )
+
+// Xiaomi Home PTZ operations for MISS_CMD_MOTOR_REQ / MISS_CMD_MOTOR_RESP.
+// angle/elevation are Xiaomi coordinates, not verified physical degrees.
+// operation=13 and ret=-5 are plugin-observed, and cmd 0x112 + {"operation":2}
+// was physically verified on xiaomi.camera.c01a01.
+const (
+	motorLeft     = 1
+	motorRight    = 2
+	motorUp       = 3
+	motorDown     = 4
+	motorCheck    = 5
+	motorGet      = 6
+	motorAbsolute = 13
+	motorStop     = -1001
+	motorCheckEnd = -5
+
+	positionMin = 1
+	positionMax = 101
+)
+
+type PTZPosition struct {
+	Angle     int       `json:"angle"`
+	Elevation int       `json:"elevation"`
+	Ret       int       `json:"ret"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type PTZState struct {
+	Connected bool
+	Position  *PTZPosition
+}
+
+type motorPayload struct {
+	Operation int  `json:"operation"`
+	Angle     *int `json:"angle,omitempty"`
+	Elevation *int `json:"elevation,omitempty"`
+}
+
+type motorResult struct {
+	position *PTZPosition
+	err      error
+}
+
+type motorResponse struct {
+	Angle     *int `json:"angle"`
+	Elevation *int `json:"elevation"`
+	Ret       *int `json:"ret"`
+}
 
 func (c *Client) StartMedia(channel, quality, audio string) error {
 	switch c.model {
@@ -233,6 +297,230 @@ func (c *Client) SpeakerCodec() uint32 {
 		return codecOPUS
 	}
 	return 0
+}
+
+func (c *Client) PTZState() PTZState {
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
+
+	var position *PTZPosition
+	if c.position != nil {
+		copy := *c.position
+		position = &copy
+	}
+
+	return PTZState{
+		Connected: c.Connected(),
+		Position:  position,
+	}
+}
+
+func (c *Client) Connected() bool {
+	select {
+	case <-c.done:
+		return false
+	default:
+		return true
+	}
+}
+
+func (c *Client) Move(direction string) error {
+	var operation int
+
+	switch direction {
+	case "left":
+		operation = motorLeft
+	case "right":
+		operation = motorRight
+	case "up":
+		operation = motorUp
+	case "down":
+		operation = motorDown
+	default:
+		return fmt.Errorf("xiaomi ptz: invalid direction %q", direction)
+	}
+
+	return c.sendMotorCommand(operation, nil, nil)
+}
+
+func (c *Client) StopMove() error {
+	return c.sendMotorCommand(motorStop, nil, nil)
+}
+
+func (c *Client) Calibrate() error {
+	return c.sendMotorCommand(motorCheck, nil, nil)
+}
+
+func (c *Client) SetPosition(angle, elevation int) error {
+	if err := validateTargetPosition(angle, elevation); err != nil {
+		return err
+	}
+	return c.sendMotorCommand(motorAbsolute, &angle, &elevation)
+}
+
+func (c *Client) RefreshPosition(ctx context.Context) (*PTZPosition, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	c.queryMu.Lock()
+	defer c.queryMu.Unlock()
+
+	waiter := make(chan motorResult, 1)
+	c.setWaiter(waiter)
+
+	if err := c.sendMotorCommand(motorGet, nil, nil); err != nil {
+		c.clearWaiter(waiter)
+		return nil, err
+	}
+
+	select {
+	case result := <-waiter:
+		return result.position, result.err
+	case <-ctx.Done():
+		c.clearWaiter(waiter)
+		return nil, ctx.Err()
+	}
+}
+
+func validateTargetPosition(angle, elevation int) error {
+	if angle < positionMin || angle > positionMax {
+		return fmt.Errorf("xiaomi ptz: angle must be between %d and %d", positionMin, positionMax)
+	}
+	if elevation < positionMin || elevation > positionMax {
+		return fmt.Errorf("xiaomi ptz: elevation must be between %d and %d", positionMin, positionMax)
+	}
+	return nil
+}
+
+func parseMotorResponse(data []byte) (*PTZPosition, error) {
+	var response motorResponse
+	if err := json.Unmarshal(data, &response); err != nil {
+		return nil, fmt.Errorf("xiaomi ptz: malformed motor response: %w", err)
+	}
+	if response.Angle == nil || response.Elevation == nil || response.Ret == nil {
+		return nil, errors.New("xiaomi ptz: malformed motor response: missing fields")
+	}
+
+	angle, elevation := *response.Angle, *response.Elevation
+	if angle < 0 || angle > 101 || elevation < 0 || elevation > 101 {
+		return nil, fmt.Errorf("xiaomi ptz: malformed motor response: angle=%d elevation=%d", angle, elevation)
+	}
+
+	return &PTZPosition{
+		Angle:     angle,
+		Elevation: elevation,
+		Ret:       *response.Ret,
+		UpdatedAt: time.Now().UTC(),
+	}, nil
+}
+
+func motorCommandPayload(operation int, angle, elevation *int) ([]byte, error) {
+	return json.Marshal(motorPayload{
+		Operation: operation,
+		Angle:     angle,
+		Elevation: elevation,
+	})
+}
+
+func (c *Client) sendMotorCommand(operation int, angle, elevation *int) error {
+	payload, err := motorCommandPayload(operation, angle, elevation)
+	if err != nil {
+		return err
+	}
+
+	data := binary.BigEndian.AppendUint32(nil, cmdMotorReq)
+	data = append(data, payload...)
+	return c.WriteCommand(data)
+}
+
+func (c *Client) commandLoop() {
+	defer close(c.done)
+
+	for {
+		cmd, data, err := c.Conn.ReadCommand()
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				c.setCommandError(err)
+			}
+			c.resolveWaiter(motorResult{err: err})
+			return
+		}
+
+		cmd, data, err = c.decodeCommand(cmd, data)
+		if err != nil {
+			c.resolveWaiter(motorResult{err: err})
+			continue
+		}
+
+		if cmd != cmdMotorRes {
+			continue
+		}
+
+		position, err := parseMotorResponse(data)
+		if err == nil {
+			c.stateMu.Lock()
+			c.position = position
+			c.stateMu.Unlock()
+		}
+
+		c.resolveWaiter(motorResult{position: position, err: err})
+	}
+}
+
+func (c *Client) decodeCommand(cmd uint32, data []byte) (uint32, []byte, error) {
+	if cmd != cmdEncoded {
+		return cmd, data, nil
+	}
+
+	data, err := crypto.Decode(data, c.key)
+	if err != nil {
+		return 0, nil, err
+	}
+	if len(data) < 4 {
+		return 0, nil, errors.New("xiaomi ptz: encoded command too small")
+	}
+
+	return binary.BigEndian.Uint32(data), data[4:], nil
+}
+
+func (c *Client) setWaiter(waiter chan motorResult) {
+	c.stateMu.Lock()
+	c.waiter = waiter
+	c.stateMu.Unlock()
+}
+
+func (c *Client) clearWaiter(waiter chan motorResult) {
+	c.stateMu.Lock()
+	if c.waiter == waiter {
+		c.waiter = nil
+	}
+	c.stateMu.Unlock()
+}
+
+func (c *Client) resolveWaiter(result motorResult) {
+	c.stateMu.Lock()
+	waiter := c.waiter
+	c.waiter = nil
+	c.stateMu.Unlock()
+
+	if waiter != nil {
+		waiter <- result
+	}
+}
+
+func (c *Client) setCommandError(err error) {
+	c.stateMu.Lock()
+	if c.readErr == nil {
+		c.readErr = err
+	}
+	c.stateMu.Unlock()
+}
+
+func (c *Client) commandError() error {
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
+	return c.readErr
 }
 
 const hdrSize = 32

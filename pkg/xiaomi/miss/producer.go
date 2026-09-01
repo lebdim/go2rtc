@@ -1,6 +1,7 @@
 package miss
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"time"
@@ -196,6 +197,30 @@ func (p *Producer) Start() error {
 func (p *Producer) Stop() error {
 	_ = p.client.StopMedia()
 	return p.Connection.Stop()
+}
+
+func (p *Producer) PTZState() PTZState {
+	return p.client.PTZState()
+}
+
+func (p *Producer) Move(direction string) error {
+	return p.client.Move(direction)
+}
+
+func (p *Producer) StopMove() error {
+	return p.client.StopMove()
+}
+
+func (p *Producer) Calibrate() error {
+	return p.client.Calibrate()
+}
+
+func (p *Producer) RefreshPosition(ctx context.Context) (*PTZPosition, error) {
+	return p.client.RefreshPosition(ctx)
+}
+
+func (p *Producer) SetPosition(angle, elevation int) error {
+	return p.client.SetPosition(angle, elevation)
 }
 
 // TimeToRTP convert time in milliseconds to RTP time
