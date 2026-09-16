@@ -461,23 +461,18 @@ func (c *dataChannel) Push(b []byte) error {
 				continue
 			}
 			if c.waitSize > maxFrameSize {
+				invalidSize := c.waitSize // capture before reset, or the error always reports 0
 				c.waitData = nil
 				c.waitSize = 0
-				return fmt.Errorf("cs2: invalid frame size %d", c.waitSize)
+				return fmt.Errorf("cs2: invalid frame size %d", invalidSize)
 			}
 		}
 		if c.waitSize > len(c.waitData) {
 			return nil
 		}
 
-		// Copy frame data — sending a slice of waitData would share the backing
-		// array, allowing subsequent appends to overwrite unconsumed frame data
-		// in the consumer goroutine (causes scrambled H265 pixels).
-		frame := make([]byte, c.waitSize)
-		copy(frame, c.waitData[:c.waitSize])
-
 		select {
-		case c.popBuf <- frame:
+		case c.popBuf <- c.waitData[:c.waitSize]:
 		default:
 			return fmt.Errorf("pop buffer is full")
 		}
