@@ -442,7 +442,8 @@ type dataChannel struct {
 	popBuf   chan []byte
 }
 
-const maxFrameSize = 2 * 1024 * 1024 // 2MB — reasonable max for 2K H265 keyframe
+// Guards a corrupt length header: unbounded, Push buffers up to 4 GiB, and on 32-bit builds int(uint32) turns negative and panics the reslice below.
+const maxFrameSize = 16 << 20
 
 func (c *dataChannel) Push(b []byte) error {
 	c.waitData = append(c.waitData, b...)
@@ -452,20 +453,19 @@ func (c *dataChannel) Push(b []byte) error {
 			if len(c.waitData) < 4 {
 				return nil
 			}
-			c.waitSize = int(binary.BigEndian.Uint32(c.waitData[:4]))
+			size := binary.BigEndian.Uint32(c.waitData[:4])
 			c.waitData = c.waitData[4:]
 
-			// Validate frame size to prevent permanent desync on corrupt size header
-			// Size 0 is valid protocol padding — skip silently (original behavior)
-			if c.waitSize == 0 {
+			// Size 0 is valid protocol padding, skip silently (original behavior)
+			if size == 0 {
 				continue
 			}
-			if c.waitSize > maxFrameSize {
-				invalidSize := c.waitSize // capture before reset, or the error always reports 0
+			// Compared as uint32: int(size) is negative on 32-bit builds and would slip past the bound
+			if size > maxFrameSize {
 				c.waitData = nil
-				c.waitSize = 0
-				return fmt.Errorf("cs2: invalid frame size %d", invalidSize)
+				return fmt.Errorf("cs2: invalid frame size %d", size)
 			}
+			c.waitSize = int(size)
 		}
 		if c.waitSize > len(c.waitData) {
 			return nil
