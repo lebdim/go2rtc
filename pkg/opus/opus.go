@@ -106,8 +106,11 @@ func JoinFrames(b1, b2 []byte) []byte {
 	b := make([]byte, 1, 3+size1+size2)
 	b[0] = b1[0] | 0b10
 	if size1 >= 252 {
-		b0 := 252 + byte(size1)&0b11
-		b = append(b, b0, byte(size1/4)-b0)
+		// RFC 6716 3.2.1: length = b0 + 4*b1, b0 in [252,255]; previous code computed
+		// the second byte as size1/4-b0 instead of (size1-b0)/4, corrupting every
+		// frame >=252 bytes (real speech routinely exceeds this).
+		b0 := byte(252 + size1&0b11)
+		b = append(b, b0, byte((size1-int(b0))/4))
 	} else {
 		b = append(b, byte(size1))
 	}
