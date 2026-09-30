@@ -48,16 +48,11 @@ func (p *Producer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiv
 		}
 	case core.CodecOpus:
 		if p.client.SpeakerCodec() == codecOPUS {
-			var buf []byte
+			pairer := &opusPairer{}
 			sender.Handler = func(pkt *rtp.Packet) {
-				if buf == nil {
-					buf = pkt.Payload
-				} else {
-					// convert two 20ms to one 40ms
-					buf = opus.JoinFrames(buf, pkt.Payload)
-					p.Send += len(buf)
-					_ = p.client.WriteAudio(codecOPUS, buf)
-					buf = nil
+				if frame := pairer.Push(pkt.SequenceNumber, pkt.Payload); frame != nil {
+					p.Send += len(frame)
+					_ = p.client.WriteAudio(codecOPUS, frame)
 				}
 			}
 		} else {
@@ -71,4 +66,32 @@ func (p *Producer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiv
 	sender.HandleRTP(track)
 	p.Senders = append(p.Senders, sender)
 	return nil
+}
+
+// opusPairer joins two consecutive 20ms Opus RTP frames into one 40ms frame for the camera speaker.
+// It resyncs on any loss, reorder or duplicate sequence number, so a single bad packet only drops
+// one pairing instead of permanently misaligning every later frame for the rest of the stream.
+type opusPairer struct {
+	buf     []byte
+	lastSeq uint16
+	haveSeq bool
+}
+
+// Push returns the joined 40ms frame once two consecutive packets have been seen, or nil while
+// waiting for the second half of the current pair.
+func (o *opusPairer) Push(seq uint16, payload []byte) []byte {
+	if o.haveSeq && seq != o.lastSeq+1 {
+		o.buf = nil
+	}
+	o.lastSeq = seq
+	o.haveSeq = true
+
+	if o.buf == nil {
+		o.buf = payload
+		return nil
+	}
+
+	frame := opus.JoinFrames(o.buf, payload)
+	o.buf = nil
+	return frame
 }
