@@ -177,6 +177,8 @@ const (
 	// ModelXiaofang looks like it has the same firmware as the ModelDafang.
 	// There is also an older model "isa.camera.isc5" that only works with the legacy protocol.
 	ModelXiaofang = "isa.camera.isc5c1"
+	// ModelCW300 outdoor cam: app shows no per-model PTZ code path, so it is assumed to share the MISS motor protocol.
+	ModelCW300 = "mxiang.camera.moc006"
 )
 
 // Xiaomi Home PTZ operations for MISS_CMD_MOTOR_REQ / MISS_CMD_MOTOR_RESP.
