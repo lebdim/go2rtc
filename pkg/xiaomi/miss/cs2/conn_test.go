@@ -1,8 +1,12 @@
 package cs2
 
 import (
+	"bytes"
 	"encoding/binary"
+	"io"
+	"net"
 	"testing"
+	"time"
 )
 
 func frame(size uint32, payload int) []byte {
@@ -83,5 +87,60 @@ func TestPushReassemblesSplitWrites(t *testing.T) {
 	}
 	if c.waitData != nil {
 		t.Fatal("waitData must be released once fully consumed")
+	}
+}
+
+type captureConn struct {
+	writes [][]byte
+}
+
+func (c *captureConn) Read([]byte) (int, error) { return 0, io.EOF }
+func (c *captureConn) Write(p []byte) (int, error) {
+	c.writes = append(c.writes, append([]byte(nil), p...))
+	return len(p), nil
+}
+func (c *captureConn) Close() error                     { return nil }
+func (c *captureConn) LocalAddr() net.Addr              { return dummyAddr("local") }
+func (c *captureConn) RemoteAddr() net.Addr             { return dummyAddr("remote") }
+func (c *captureConn) SetDeadline(time.Time) error      { return nil }
+func (c *captureConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *captureConn) SetWriteDeadline(time.Time) error { return nil }
+
+type dummyAddr string
+
+func (a dummyAddr) Network() string { return "test" }
+func (a dummyAddr) String() string  { return string(a) }
+
+func TestWritePacketAppendsPayload(t *testing.T) {
+	wire := &captureConn{}
+	c := &Conn{Conn: wire}
+
+	hdr := bytes.Repeat([]byte{0x11}, hdrSize)
+	payload := []byte{0xAA, 0xBB, 0xCC, 0xDD}
+
+	if err := c.WritePacket(hdr, payload); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(wire.writes) != 1 {
+		t.Fatalf("expected 1 write, got %d", len(wire.writes))
+	}
+
+	const offset = 12
+	got := wire.writes[0]
+	if len(got) != offset+hdrSize+len(payload) {
+		t.Fatalf("unexpected wire size: got %d want %d", len(got), offset+hdrSize+len(payload))
+	}
+	if want := uint16(hdrSize + len(payload) + 8); binary.BigEndian.Uint16(got[2:4]) != want {
+		t.Fatalf("unexpected DRW size: got %d want %d", binary.BigEndian.Uint16(got[2:4]), want)
+	}
+	if want := uint32(hdrSize + len(payload)); binary.BigEndian.Uint32(got[8:12]) != want {
+		t.Fatalf("unexpected payload size: got %d want %d", binary.BigEndian.Uint32(got[8:12]), want)
+	}
+	if !bytes.Equal(got[offset:offset+hdrSize], hdr) {
+		t.Fatal("header bytes mismatch")
+	}
+	if !bytes.Equal(got[offset+hdrSize:], payload) {
+		t.Fatal("payload bytes mismatch")
 	}
 }
