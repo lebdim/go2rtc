@@ -1,6 +1,9 @@
 package miss
 
 import (
+	"fmt"
+	"net"
+	"os/exec"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
@@ -17,6 +20,15 @@ func (p *Producer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiv
 	time.Sleep(time.Second)
 
 	sender := core.NewSender(media, track.Codec)
+
+	if (track.Codec.Name == core.CodecPCMU || track.Codec.Name == core.CodecPCMA) && p.client.SpeakerCodec() != codecPCM {
+		if err := p.bridgeG711ToOpus(sender, track); err != nil {
+			return err
+		}
+		sender.HandleRTP(track)
+		p.Senders = append(p.Senders, sender)
+		return nil
+	}
 
 	switch track.Codec.Name {
 	case core.CodecPCMA:
@@ -94,4 +106,61 @@ func (o *opusPairer) Push(seq uint16, payload []byte) []byte {
 	frame := opus.JoinFrames(o.buf, payload)
 	o.buf = nil
 	return frame
+}
+
+// bridgeG711ToOpus lets a G.711 talker (Synology Surveillance Station sends PCMU/8000) drive a camera whose speaker only plays
+// Opus: an ffmpeg child encodes 40 ms Opus frames and hands them back over a loopback RTP socket.
+func (p *Producer) bridgeG711ToOpus(sender *core.Sender, track *core.Receiver) error {
+	format := "mulaw"
+	if track.Codec.Name == core.CodecPCMA {
+		format = "alaw"
+	}
+
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		return err
+	}
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+
+	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-fflags", "nobuffer", "-flags", "low_delay",
+		"-probesize", "32", "-analyzeduration", "0", "-f", format, "-ar", "8000", "-ac", "1", "-i", "pipe:0",
+		"-c:a", "libopus", "-application", "voip", "-frame_duration", "40", "-b:a", "24k", "-ar", "48000", "-ac", "2",
+		"-f", "rtp", "-payload_type", "111", fmt.Sprintf("rtp://127.0.0.1:%d", port))
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		_ = conn.Close()
+		return err
+	}
+	if err = cmd.Start(); err != nil {
+		_ = conn.Close()
+		return err
+	}
+
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, _, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if n > 12 {
+				frame := append([]byte(nil), buf[12:n]...)
+				p.Send += len(frame)
+				_ = p.client.WriteAudio(codecOPUS, frame)
+			}
+		}
+	}()
+
+	sender.Handler = func(pkt *rtp.Packet) {
+		_, _ = stdin.Write(pkt.Payload)
+	}
+	p.closers = append(p.closers, func() {
+		_ = stdin.Close()
+		_ = conn.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	})
+	return nil
 }

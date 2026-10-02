@@ -187,20 +187,25 @@ func tcpHandler(conn *rtsp.Conn) {
 			}
 
 			if query.Get("backchannel") == "1" {
+				codecs := []*core.Codec{
+					{Name: core.CodecOpus, ClockRate: 48000, Channels: 2},
+					{Name: core.CodecPCM, ClockRate: 16000},
+					{Name: core.CodecPCMA, ClockRate: 16000},
+					{Name: core.CodecPCMU, ClockRate: 16000},
+					{Name: core.CodecPCM, ClockRate: 8000},
+					{Name: core.CodecPCMA, ClockRate: 8000},
+					{Name: core.CodecPCMU, ClockRate: 8000},
+					{Name: core.CodecAAC, ClockRate: 8000},
+					{Name: core.CodecAAC, ClockRate: 16000},
+				}
+				// bc=pcmu offers only G.711 u-law, for clients like Synology Surveillance Station that require PCMU/8000
+				if query.Get("bc") == "pcmu" {
+					codecs = []*core.Codec{{Name: core.CodecPCMU, ClockRate: 8000}}
+				}
 				conn.Medias = append(conn.Medias, &core.Media{
 					Kind:      core.KindAudio,
 					Direction: core.DirectionRecvonly,
-					Codecs: []*core.Codec{
-						{Name: core.CodecOpus, ClockRate: 48000, Channels: 2},
-						{Name: core.CodecPCM, ClockRate: 16000},
-						{Name: core.CodecPCMA, ClockRate: 16000},
-						{Name: core.CodecPCMU, ClockRate: 16000},
-						{Name: core.CodecPCM, ClockRate: 8000},
-						{Name: core.CodecPCMA, ClockRate: 8000},
-						{Name: core.CodecPCMU, ClockRate: 8000},
-						{Name: core.CodecAAC, ClockRate: 8000},
-						{Name: core.CodecAAC, ClockRate: 16000},
-					},
+					Codecs:    codecs,
 				})
 			}
 

@@ -15,7 +15,8 @@ import (
 
 type Producer struct {
 	core.Connection
-	client *Client
+	client  *Client
+	closers []func()
 }
 
 func Dial(rawURL string) (core.Producer, error) {
@@ -119,7 +120,11 @@ func probe(client *Client, audio bool) ([]*core.Media, error) {
 		medias = append(medias, &core.Media{
 			Kind:      core.KindAudio,
 			Direction: core.DirectionSendonly,
-			Codecs:    []*core.Codec{acodec.Clone()},
+			Codecs: []*core.Codec{
+				acodec.Clone(),
+				{Name: core.CodecPCMU, ClockRate: 8000},
+				{Name: core.CodecPCMA, ClockRate: 8000},
+			},
 		})
 	}
 
@@ -195,6 +200,10 @@ func (p *Producer) Start() error {
 }
 
 func (p *Producer) Stop() error {
+	for _, closeFn := range p.closers {
+		closeFn()
+	}
+	p.closers = nil
 	_ = p.client.StopMedia()
 	return p.Connection.Stop()
 }
