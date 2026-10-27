@@ -54,7 +54,10 @@ func Dial(rawURL string) (core.Producer, error) {
 }
 
 func probe(client *Client, audio bool) ([]*core.Media, error) {
-	_ = client.SetDeadline(time.Now().Add(15 * time.Second))
+	// Use the same margin as the steady-state read loop below: a reconnect that lands
+	// mid-stall must survive it too, or probing just relocates the timeout (seen in
+	// production 2026-10-27, ~17s stall vs the old hardcoded 15s here).
+	_ = client.SetDeadline(time.Now().Add(readDeadline))
 
 	var vcodec, acodec *core.Codec
 
