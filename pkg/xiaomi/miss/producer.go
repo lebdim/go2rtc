@@ -128,11 +128,16 @@ func probe(client *Client, audio bool) ([]*core.Media, error) {
 
 const timestamp40ms = 48000 * 0.040
 
+// readDeadline must exceed the camera's own periodic cs2 stall (measured 12-13s on a
+// Xiaomi CW300/moc006 over UDP transport), or every stall forces a full P2P renegotiation
+// (~20s) instead of letting the read simply block through the gap.
+const readDeadline = 20 * time.Second
+
 func (p *Producer) Start() error {
 	var audioTS uint32
 
 	for {
-		_ = p.client.SetDeadline(time.Now().Add(10 * time.Second))
+		_ = p.client.SetDeadline(time.Now().Add(readDeadline))
 		pkt, err := p.client.ReadPacket()
 		if err != nil {
 			return err
