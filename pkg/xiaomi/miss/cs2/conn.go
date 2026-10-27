@@ -24,9 +24,11 @@ func Dial(host, transport string) (*Conn, error) {
 		Conn:  conn,
 		isTCP: isTCP,
 		channels: [4]*dataChannel{
-			newDataChannel(0, 10), nil, newDataChannel(250, 100), nil,
+			newDataChannel(0, 10), nil, newDataChannel(250, 300), nil,
 		},
 	}
+	// A slow consumer or a post-stall burst must cost a few frames, not the whole P2P session.
+	c.channels[2].dropOldest = true
 	go c.worker()
 	return c, nil
 }
@@ -43,6 +45,8 @@ type Conn struct {
 
 	cmdMu  sync.Mutex
 	cmdAck func()
+
+	dead atomic.Bool // worker has exited, the session is unusable
 }
 
 const (
@@ -108,11 +112,16 @@ func handshake(host, transport string) (net.Conn, error) {
 
 func (c *Conn) worker() {
 	defer func() {
+		c.dead.Store(true)
 		c.channels[0].Close()
 		c.channels[2].Close()
 	}()
 
 	var keepaliveTS time.Time // only for TCP
+
+	var lastDrw time.Time
+	var ctlCount int
+	var ctlLast byte
 
 	buf := make([]byte, 1200)
 
@@ -120,11 +129,19 @@ func (c *Conn) worker() {
 		n, err := c.Conn.Read(buf)
 		if err != nil {
 			c.err = fmt.Errorf("%s: %w", "cs2", err)
+			if !lastDrw.IsZero() {
+				fmt.Printf("cs2: read failed %s after last data, control msgs since: %d, last type: %x\n",
+					time.Since(lastDrw).Round(time.Millisecond), ctlCount, ctlLast)
+			}
 			return
 		}
 
 		if n < 2 {
 			continue // too short to have msg type
+		}
+
+		if buf[1] != msgDrw {
+			ctlCount, ctlLast = ctlCount+1, buf[1]
 		}
 
 		// 0  f1d0  magic
@@ -142,6 +159,13 @@ func (c *Conn) worker() {
 				continue // skip invalid channel
 			}
 			channel := c.channels[ch]
+
+			// Stall diagnostics: does the camera keep talking (ping/ack/close) while media is silent?
+			if now := time.Now(); !lastDrw.IsZero() && now.Sub(lastDrw) > 5*time.Second {
+				fmt.Printf("cs2: media gap %s, control msgs in gap: %d, last type: %x\n",
+					now.Sub(lastDrw).Round(time.Millisecond), ctlCount, ctlLast)
+			}
+			lastDrw, ctlCount = time.Now(), 0
 
 			if c.isTCP {
 				// For TCP we should send ping every second to keep connection alive.
@@ -187,6 +211,14 @@ func (c *Conn) worker() {
 	}
 }
 
+// Close tells the camera to free the session instead of leaving it to time out.
+func (c *Conn) Close() error {
+	if !c.isTCP {
+		_, _ = c.Conn.Write([]byte{magic, msgClose, 0, 0})
+	}
+	return c.Conn.Close()
+}
+
 func (c *Conn) Protocol() string {
 	if c.isTCP {
 		return "cs2+tcp"
@@ -218,6 +250,11 @@ func (c *Conn) ReadCommand() (cmd uint32, data []byte, err error) {
 func (c *Conn) WriteCommand(cmd uint32, data []byte) error {
 	c.cmdMu.Lock()
 	defer c.cmdMu.Unlock()
+
+	// Without the worker no ACK can ever arrive: skip the 5 s resend loop.
+	if c.dead.Load() {
+		return c.Error()
+	}
 
 	req := marshalCmd(0, c.seqCh0, cmd, data)
 	c.seqCh0++
@@ -440,6 +477,9 @@ type dataChannel struct {
 	waitData []byte
 	waitSize int
 	popBuf   chan []byte
+
+	dropOldest bool
+	dropped    int
 }
 
 // Guards a corrupt length header: unbounded, Push buffers up to 4 GiB, and on 32-bit builds int(uint32) turns negative and panics the reslice below.
@@ -474,7 +514,18 @@ func (c *dataChannel) Push(b []byte) error {
 		select {
 		case c.popBuf <- c.waitData[:c.waitSize]:
 		default:
-			return fmt.Errorf("pop buffer is full")
+			if !c.dropOldest {
+				return fmt.Errorf("pop buffer is full")
+			}
+			// Push only runs on the worker goroutine, so nobody else can take the freed slot.
+			select {
+			case <-c.popBuf:
+			default:
+			}
+			c.popBuf <- c.waitData[:c.waitSize]
+			if c.dropped++; c.dropped == 1 || c.dropped%100 == 0 {
+				fmt.Printf("cs2: consumer too slow, dropped %d media packets\n", c.dropped)
+			}
 		}
 
 		c.waitData = c.waitData[c.waitSize:]

@@ -16,6 +16,9 @@ import (
 type Producer struct {
 	core.Connection
 	client *Client
+
+	// pre holds the packets probe() consumed, starting at the first SPS/VPS keyframe.
+	pre []*Packet
 }
 
 func Dial(rawURL string) (core.Producer, error) {
@@ -33,7 +36,7 @@ func Dial(rawURL string) (core.Producer, error) {
 		return nil, err
 	}
 
-	medias, err := probe(client, query.Get("audio") != "0")
+	medias, pre, err := probe(client, query.Get("audio") != "0")
 	if err != nil {
 		_ = client.Close()
 		return nil, err
@@ -50,16 +53,19 @@ func Dial(rawURL string) (core.Producer, error) {
 			Transport:  client,
 		},
 		client: client,
+		pre:    pre,
 	}, nil
 }
 
-func probe(client *Client, audio bool) ([]*core.Media, error) {
+func probe(client *Client, audio bool) ([]*core.Media, []*Packet, error) {
 	// Use the same margin as the steady-state read loop below: a reconnect that lands
 	// mid-stall must survive it too, or probing just relocates the timeout (seen in
 	// production 2026-10-27, ~17s stall vs the old hardcoded 15s here).
 	_ = client.SetDeadline(time.Now().Add(readDeadline))
 
 	var vcodec, acodec *core.Codec
+	var pre []*Packet
+	var preFull bool
 
 	for {
 		pkt, err := client.ReadPacket()
@@ -69,7 +75,7 @@ func probe(client *Client, audio bool) ([]*core.Media, error) {
 			} else if acodec != nil {
 				err = fmt.Errorf("no video")
 			}
-			return nil, fmt.Errorf("xiaomi: probe: %w", err)
+			return nil, nil, fmt.Errorf("xiaomi: probe: %w", err)
 		}
 
 		switch pkt.CodecID {
@@ -94,6 +100,16 @@ func probe(client *Client, audio bool) ([]*core.Media, error) {
 		case codecOPUS:
 			if acodec == nil {
 				acodec = &core.Codec{Name: core.CodecOpus, ClockRate: 48000, Channels: 2}
+			}
+		}
+
+		// Keep everything from the first keyframe on: Start replays it, otherwise the first
+		// IDR is lost and the first consumer waits a full GOP for the next one.
+		if vcodec != nil && !preFull {
+			if len(pre) >= maxProbePackets {
+				pre, preFull = nil, true
+			} else {
+				pre = append(pre, pkt)
 			}
 		}
 
@@ -126,24 +142,33 @@ func probe(client *Client, audio bool) ([]*core.Media, error) {
 		})
 	}
 
-	return medias, nil
+	return medias, pre, nil
 }
 
 const timestamp40ms = 48000 * 0.040
 
-// readDeadline must exceed the camera's own periodic cs2 stall (measured 12-13s on a
+const maxProbePackets = 128
+
+// readDeadline must exceed the camera's own periodic cs2 stall (observed 12-29s on a
 // Xiaomi CW300/moc006 over UDP transport), or every stall forces a full P2P renegotiation
-// (~20s) instead of letting the read simply block through the gap.
-const readDeadline = 20 * time.Second
+// (~20s) instead of letting the read simply block through the gap. The deadline is applied
+// to the shared UDP socket, so expiry also kills the cs2 worker: keep it well above the
+// longest stall seen.
+const readDeadline = 45 * time.Second
 
 func (p *Producer) Start() error {
 	var audioTS uint32
 
 	for {
-		_ = p.client.SetDeadline(time.Now().Add(readDeadline))
-		pkt, err := p.client.ReadPacket()
-		if err != nil {
-			return err
+		var pkt *Packet
+		if len(p.pre) > 0 {
+			pkt, p.pre = p.pre[0], p.pre[1:]
+		} else {
+			_ = p.client.SetDeadline(time.Now().Add(readDeadline))
+			var err error
+			if pkt, err = p.client.ReadPacket(); err != nil {
+				return err
+			}
 		}
 
 		p.Recv += len(pkt.Payload)

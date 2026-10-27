@@ -144,3 +144,29 @@ func TestWritePacketAppendsPayload(t *testing.T) {
 		t.Fatal("payload bytes mismatch")
 	}
 }
+
+func TestMediaChannelDropsOldestWhenFull(t *testing.T) {
+	c := newDataChannel(0, 2)
+	c.dropOldest = true
+
+	for _, s := range []string{"a", "b", "c"} {
+		if err := c.Push(append(frame(1, 0), s...)); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+
+	for _, want := range []string{"b", "c"} {
+		if data, _ := c.Pop(); string(data) != want {
+			t.Fatalf("expected %q, got %q", want, data)
+		}
+	}
+}
+
+func TestStrictChannelFailsWhenFull(t *testing.T) {
+	c := newDataChannel(0, 1)
+
+	_ = c.Push(append(frame(1, 0), 'a'))
+	if err := c.Push(append(frame(1, 0), 'b')); err == nil {
+		t.Fatal("expected pop buffer is full error")
+	}
+}
